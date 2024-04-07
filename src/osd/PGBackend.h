@@ -101,6 +101,9 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
        const ObjectRecoveryInfo &recovery_info
        ) = 0;
 
+     virtual bool is_backfilling_in_flight(const hobject_t &oid) = 0;
+     virtual void on_backfilling_write_recover(const hobject_t &oid) = 0;
+
      virtual void begin_peer_recover(
        pg_shard_t peer,
        const hobject_t oid) = 0;

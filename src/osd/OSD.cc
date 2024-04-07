@@ -10343,6 +10343,8 @@ const char** OSD::get_tracked_conf_keys() const
     "osd_heartbeat_interval",
     "osd_scrub_min_interval",
     "osd_scrub_max_interval",
+    "osd_backfilling_write",
+    "osd_backfilling_write_obj_prefix",
     NULL
   };
   return KEYS;

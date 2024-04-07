@@ -286,6 +286,10 @@ public:
   void begin_peer_recover(
     pg_shard_t peer,
     const hobject_t oid) override;
+
+  bool is_backfilling_in_flight(const hobject_t &oid) override;
+  void on_backfilling_write_recover(const hobject_t &oid) override;
+
   void on_global_recover(
     const hobject_t &oid,
     const object_stat_sum_t &stat_diff,

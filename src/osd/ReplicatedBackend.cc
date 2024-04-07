@@ -282,11 +282,13 @@ void generate_transaction(
   vector<pg_log_entry_t> &log_entries,
   ObjectStore::Transaction *t,
   set<hobject_t> *added,
-  set<hobject_t> *removed)
+  set<hobject_t> *removed,
+  set<hobject_t> *temps)
 {
   ceph_assert(t);
   ceph_assert(added);
   ceph_assert(removed);
+  ceph_assert(temps);
 
   for (auto &&le: log_entries) {
     le.mark_unrollbackable();
@@ -312,6 +314,183 @@ void generate_transaction(
 	} else if (op.is_delete()) {
 	  removed->insert(oid);
 	}
+      }
+      // to collect write backfilling obj
+      if(strstr(oid.oid.name.c_str(), "temp_recovering_") != NULL) {
+        temps->insert(oid);
+        return;
+      }
+
+      if (op.delete_first) {
+	t->remove(coll, goid);
+      }
+
+      match(
+	op.init_type,
+	[&](const PGTransaction::ObjectOperation::Init::None &) {
+	},
+	[&](const PGTransaction::ObjectOperation::Init::Create &op) {
+	  t->touch(coll, goid);
+	},
+	[&](const PGTransaction::ObjectOperation::Init::Clone &op) {
+	  t->clone(
+	    coll,
+	    ghobject_t(
+	      op.source, ghobject_t::NO_GEN, shard_id_t::NO_SHARD),
+	    goid);
+	},
+	[&](const PGTransaction::ObjectOperation::Init::Rename &op) {
+	  ceph_assert(op.source.is_temp());
+	  t->collection_move_rename(
+	    coll,
+	    ghobject_t(
+	      op.source, ghobject_t::NO_GEN, shard_id_t::NO_SHARD),
+	    coll,
+	    goid);
+	});
+
+      if (op.truncate) {
+	t->truncate(coll, goid, op.truncate->first);
+	if (op.truncate->first != op.truncate->second)
+	  t->truncate(coll, goid, op.truncate->second);
+      }
+
+      if (!op.attr_updates.empty()) {
+	map<string, bufferlist> attrs;
+	for (auto &&p: op.attr_updates) {
+	  if (p.second)
+	    attrs[p.first] = *(p.second);
+	  else
+	    t->rmattr(coll, goid, p.first);
+	}
+	t->setattrs(coll, goid, attrs);
+      }
+
+      if (op.clear_omap)
+	t->omap_clear(coll, goid);
+      if (op.omap_header)
+	t->omap_setheader(coll, goid, *(op.omap_header));
+
+      for (auto &&up: op.omap_updates) {
+	using UpdateType = PGTransaction::ObjectOperation::OmapUpdateType;
+	switch (up.first) {
+	case UpdateType::Remove:
+	  t->omap_rmkeys(coll, goid, up.second);
+	  break;
+	case UpdateType::Insert:
+	  t->omap_setkeys(coll, goid, up.second);
+	  break;
+	}
+      }
+
+      // updated_snaps doesn't matter since we marked unrollbackable
+
+      if (op.alloc_hint) {
+	auto &hint = *(op.alloc_hint);
+	t->set_alloc_hint(
+	  coll,
+	  goid,
+	  hint.expected_object_size,
+	  hint.expected_write_size,
+	  hint.flags);
+      }
+
+      for (auto &&extent: op.buffer_updates) {
+	using BufferUpdate = PGTransaction::ObjectOperation::BufferUpdate;
+	match(
+	  extent.get_val(),
+	  [&](const BufferUpdate::Write &op) {
+	    t->write(
+	      coll,
+	      goid,
+	      extent.get_off(),
+	      extent.get_len(),
+	      op.buffer);
+	  },
+	  [&](const BufferUpdate::Zero &op) {
+	    t->zero(
+	      coll,
+	      goid,
+	      extent.get_off(),
+	      extent.get_len());
+	  },
+	  [&](const BufferUpdate::CloneRange &op) {
+	    ceph_assert(op.len == extent.get_len());
+	    t->clone_range(
+	      coll,
+	      ghobject_t(op.from, ghobject_t::NO_GEN, shard_id_t::NO_SHARD),
+	      goid,
+	      op.offset,
+	      extent.get_len(),
+	      extent.get_off());
+	  });
+      }
+    });
+}
+
+void generate_transaction_for_backfilling_write(
+  PGTransactionUPtr &pgt,
+  const coll_t &coll,
+  vector<pg_log_entry_t> &log_entries,
+  ObjectStore::Transaction *t,
+  eversion_t version)
+{
+  ceph_assert(t);
+
+  for (auto &&le: log_entries) {
+    le.mark_unrollbackable();
+    auto oiter = pgt->op_map.find(le.soid);
+    if (oiter != pgt->op_map.end() && oiter->second.updated_snaps) {
+      bufferlist bl(oiter->second.updated_snaps->second.size() * 8 + 8);
+      encode(oiter->second.updated_snaps->second, bl);
+      le.snaps.swap(bl);
+      le.snaps.reassign_to_mempool(mempool::mempool_osd_pglog);
+    }
+  }
+
+  pgt->safe_create_traverse(
+    [&](pair<const hobject_t, PGTransaction::ObjectOperation> &obj_op) {
+      const hobject_t &oid = obj_op.first;
+      //ghobject_t goid = ghobject_t(oid, ghobject_t::NO_GEN, shard_id_t::NO_SHARD);
+      ghobject_t goid;
+      const PGTransaction::ObjectOperation &op = obj_op.second;
+      if (strstr(oid.oid.name.c_str(), "temp_recovering_") != NULL) {
+        /* temp obj name:
+        ss << "temp_recovering_" << info.pgid  // (note this includes the shardid for ec pool)
+           << "_" << version
+           << "_" << info.history.same_interval_since
+           << "_" << target.snap;*/
+        string new_name = oid.oid.name;
+        //to replace version
+        int count = 0;
+        int start_pos = 0,end_pos = 0;
+        bool found1 = false;
+        bool found2 = false;
+        for (int i = 0;i < new_name.size();i++) {
+          if (new_name[i] == '_') {
+            count++;
+          }
+          if (count == 3 && !found1) {
+            start_pos = i;
+            found1 = true;
+          }
+          if (count == 4 && !found2) {
+            end_pos = i + 1;
+            found2 = true;
+          }
+        }
+        string str1 = new_name.substr(0, start_pos);
+        string str2 = new_name.substr(end_pos);
+        ostringstream s_version;
+        s_version << version;
+        string nn_name = str1 + "_" + s_version.str() + "_" + str2;
+        auto noid = oid;
+        noid.oid.name = nn_name;
+        goid = ghobject_t(noid, ghobject_t::NO_GEN, shard_id_t::NO_SHARD);
+        //dout(10) << __func__ << "after replace, str is : " << oid.oid.name.c_str() << endl;
+      } else {
+          // ignore normal obj write.
+          return;
       }
 
       if (op.delete_first) {
@@ -442,16 +621,18 @@ void ReplicatedBackend::submit_transaction(
   vector<pg_log_entry_t> log_entries(_log_entries);
   ObjectStore::Transaction op_t;
   PGTransactionUPtr t(std::move(_t));
-  set<hobject_t> added, removed;
+  set<hobject_t> added, removed, temps;
   generate_transaction(
     t,
     coll,
     log_entries,
     &op_t,
     &added,
-    &removed);
+    &removed,
+    &temps);
   ceph_assert(added.size() <= 1);
   ceph_assert(removed.size() <= 1);
+  ceph_assert(temps.size() <= 1);
 
   auto insert_res = in_progress_ops.insert(
     make_pair(
@@ -467,6 +648,127 @@ void ReplicatedBackend::submit_transaction(
   op.waiting_for_commit.insert(
     parent->get_acting_recovery_backfill_shards().begin(),
     parent->get_acting_recovery_backfill_shards().end());
+
+  // for replica write backfilling obj
+  if (temps.size() >= 1) {
+    for (auto it = temps.begin();it != temps.end();it++) {
+      dout(1) << __func__ << " get temp obj " << *it << dendl;
+    }
+    set<pg_shard_t> backfills;
+    if (parent->get_acting_recovery_backfill_shards().size() > 1) {
+      if (op.op) {
+        op.op->pg_trace.event("issue replication ops");
+        ostringstream ss;
+        set<pg_shard_t> replicas = parent->get_acting_recovery_backfill_shards();
+        replicas.erase(parent->whoami_shard());
+        ss << "waiting for subops from " << replicas;
+        op.op->mark_sub_op_sent(ss.str());
+      }
+      bufferlist logs;
+      encode(log_entries, logs);
+      // for backfill pg
+      if (parent->get_backfill_shards().size() >= 1) {
+        for (const auto& shard : parent->get_backfill_shards()) {
+          dout(1) << __func__ << " backfill shard " << shard << dendl;
+          if (pushing.count(soid)) {
+                if (pushing[soid].count(shard)) {
+                  PushInfo *pi = &pushing[soid][shard];
+                  bool error = pushing[soid].begin()->second.recovery_progress.error;
+                  // data complete and an temp recover obj has be removed,
+                  // so we cannot write an temp recover obj.
+                  dout(1) << __func__ << " backfill data complete " << pi->recovery_progress.data_complete << dendl;
+                  if (pi->recovery_progress.data_complete && !error) continue;     
+                }
+          }
+          if (shard == parent->whoami_shard()) continue;
+
+          ObjectStore::Transaction op_t2; // for backfill shard op
+          // only write an recover temp obj
+          // use pi->recovery_info.version to modify pg temp obj version.
+          // temp object name:
+          /* ss << "temp_recovering_" << info.pgid  // (note this includes the shardid)
+                << "_" << version
+                << "_" << info.history.same_interval_since
+                << "_" << target.snap;*/
+          // to filter temp obj transaction and modify verison
+          generate_transaction_for_backfilling_write(t, coll, log_entries, 
+            &op_t2, pushing[soid][shard].recovery_info.version);
+          const pg_info_t &pinfo = parent->get_shard_info().find(shard)->second;
+          Message *wr;
+          wr = generate_subop(
+  	    soid,
+  	    at_version,
+  	    tid,
+  	    reqid,
+  	    trim_to,
+  	    at_version,
+            added.size() ? *(added.begin()) : hobject_t(),
+            removed.size() ? *(removed.begin()) : hobject_t(),
+  	    logs,
+  	    hset_history,
+  	    op_t2,
+  	    shard,
+  	    pinfo);
+          if (op.op && op.op->pg_trace)
+  	    wr->trace.init("backfill replicated op", nullptr, &op.op->pg_trace);
+          get_parent()->send_message_osd_cluster(
+  	    shard.osd, wr, get_osdmap_epoch());
+          backfills.insert(shard);
+        }
+      }
+  
+      // for acting pg
+      for (const auto& shard : get_parent()->get_acting_recovery_backfill_shards()) {
+        if (shard == parent->whoami_shard()) continue;
+        if (backfills.count(shard)) continue;
+        const pg_info_t &pinfo = parent->get_shard_info().find(shard)->second;
+        Message *wr;
+        wr = generate_subop(
+  	  soid,
+  	  at_version,
+  	  tid,
+  	  reqid,
+  	  trim_to,
+  	  at_version,
+          added.size() ? *(added.begin()) : hobject_t(),
+          removed.size() ? *(removed.begin()) : hobject_t(),
+  	  logs,
+  	  hset_history,
+  	  op_t,
+  	  shard,
+  	  pinfo);
+        if (op.op && op.op->pg_trace)
+  	  wr->trace.init("replicated op", nullptr, &op.op->pg_trace);
+        get_parent()->send_message_osd_cluster(
+  	  shard.osd, wr, get_osdmap_epoch());
+      }
+    }
+
+    // for primary shard
+    add_temp_objs(added);
+    clear_temp_objs(removed);
+    
+    parent->log_operation(
+      log_entries,
+      hset_history,
+      trim_to,
+      at_version,
+      true,
+      op_t);
+    
+    op_t.register_on_commit(
+      parent->bless_context(
+        new C_OSD_OnOpCommit(this, &op)));
+    
+    vector<ObjectStore::Transaction> tls;
+    tls.push_back(std::move(op_t));
+    
+    parent->queue_transactions(tls, op.op);
+    if (at_version != eversion_t()) {
+      parent->op_applied(at_version);
+    }   
+    return;
+  }
 
   issue_op(
     soid,
@@ -2088,6 +2390,23 @@ bool ReplicatedBackend::handle_push_reply(
 	goto done;
       }
       pi->recovery_progress = new_progress;
+      if (cct->_conf->osd_backfilling_write && !cct->_conf->osd_backfilling_write_obj_prefix.empty() &&
+        get_parent()->is_backfilling_in_flight(soid)) {
+        if (strstr(soid.oid.name.c_str(), cct->_conf->osd_backfilling_write_obj_prefix.c_str()) == NULL) {
+          return true;
+        }
+        dout(10) << "backfilling obj " << soid << " osd_backfilling_write_obj_prefix " 
+                                       << cct->_conf->osd_backfilling_write_obj_prefix << dendl;
+        auto iter = pushing[soid].begin();
+        // wait all backfill pg obj header is recovered
+        while (iter != pushing[soid].end()) {
+          if (iter->second.recovery_progress.first) {
+            return true;
+          }
+          iter++;
+        }
+        get_parent()->on_backfilling_write_recover(soid);
+      }
       return true;
     } else {
       // done!

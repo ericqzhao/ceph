@@ -3758,6 +3758,14 @@ std::vector<Option> get_global_options() {
                      "and historical missing objects,  above which we switch to use "
                      "asynchronous recovery when appropriate"),
 
+    Option("osd_backfilling_write", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_default(false)
+    .set_description(""),
+
+    Option("osd_backfilling_write_obj_prefix", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description(""),
+  
     Option("osd_max_pg_per_osd_hard_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(3)
     .set_min(1)

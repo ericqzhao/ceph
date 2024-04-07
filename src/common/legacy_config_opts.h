@@ -533,6 +533,10 @@ OPTION(osd_max_backfills, OPT_U64)
 // Minimum recovery priority (255 = max, smaller = lower)
 OPTION(osd_min_recovery_priority, OPT_INT)
 
+OPTION(osd_backfilling_write, OPT_BOOL)
+
+OPTION(osd_backfilling_write_obj_prefix, OPT_STR)
+
 // Seconds to wait before retrying refused backfills
 OPTION(osd_backfill_retry_interval, OPT_DOUBLE)
 

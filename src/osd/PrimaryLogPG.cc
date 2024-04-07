@@ -493,6 +493,39 @@ void PrimaryLogPG::on_global_recover(
   finish_degraded_object(soid);
 }
 
+bool PrimaryLogPG::is_backfilling_in_flight(const hobject_t &oid)
+{
+  bool is_backfilling = backfills_in_flight.count(oid) > 0;
+  dout(10) << "obj: "<< oid  << " is backfilling: " << is_backfilling << dendl;
+  return is_backfilling;
+}
+
+void PrimaryLogPG::on_backfilling_write_recover(const hobject_t &oid)
+{
+  dout(10) << "backfilling_in_flight_erase obj" << oid << dendl;
+  backfills_in_flight.erase(oid);
+
+  auto degraded_object_entry = waiting_for_degraded_object.find(oid);
+  if (degraded_object_entry != waiting_for_degraded_object.end()) {
+    dout(20) << " kicking backfilling write waiters on " << oid << dendl;
+    requeue_ops(degraded_object_entry->second);
+    waiting_for_degraded_object.erase(degraded_object_entry);
+  }
+
+  // to release obc recover read lock
+  map<hobject_t, ObjectContextRef>::iterator i = recovering.find(oid);
+  ceph_assert(i != recovering.end());
+
+  if (i->second && i->second->rwstate.recovery_read_marker) {
+    // recover missing won't have had an obc, but it gets filled in
+    // during on_local_recover
+    ceph_assert(i->second);
+    list<OpRequestRef> requeue_list;
+    i->second->drop_recovery_read(&requeue_list);
+    requeue_ops(requeue_list);
+  }
+}  
+
 void PrimaryLogPG::on_peer_recover(
   pg_shard_t peer,
   const hobject_t &soid,
@@ -571,6 +604,12 @@ bool PrimaryLogPG::should_send_op(
              << " beyond std::max(last_backfill_started "
              << ", peer_info[peer].last_backfill "
              << peer_info[peer].last_backfill << ")" << dendl;
+    if (cct->_conf->osd_backfilling_write && !cct->_conf->osd_backfilling_write_obj_prefix.empty()) {
+      dout(10) << "backfilling obj can send op" << hoid << dendl;
+      if(strstr(hoid.oid.name.c_str(), cct->_conf->osd_backfilling_write_obj_prefix.c_str()) != NULL) {
+        return true;
+      }
+    }
     return should_send;
   }
   if (async_recovery_targets.count(peer) && peer_missing[peer].is_missing(hoid)) {
@@ -656,6 +695,20 @@ bool PrimaryLogPG::is_degraded_or_backfilling_object(const hobject_t& soid)
     if (*i == get_primary()) continue;
     pg_shard_t peer = *i;
     auto peer_missing_entry = peer_missing.find(peer);
+
+    // If an backfilling obj has recovered omap header but not for data, we can return false to unblock
+    // backfilling write. Otherwise we need to wait for omap header recover finished.
+    if (cct->_conf->osd_backfilling_write && !cct->_conf->osd_backfilling_write_obj_prefix.empty()) {
+      if (strstr(soid.oid.name.c_str(), cct->_conf->osd_backfilling_write_obj_prefix.c_str()) != NULL) {
+        if (peer_missing_entry != peer_missing.end() &&
+          peer_missing_entry->second.get_items().count(soid) &&
+          is_backfill_targets(peer) &&
+          !backfills_in_flight.count(soid)) {
+          return false;
+        }
+      }
+    }
+
     // If an object is missing on an async_recovery_target, return false.
     // This will not block the op and the object is async recovered later.
     if (peer_missing_entry != peer_missing.end() &&
@@ -7633,6 +7686,32 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	t->omap_setkeys(soid, to_set_bl);
 	ctx->delta_stats.num_wr++;
         ctx->delta_stats.num_wr_kb += shift_round_up(to_set_bl.length(), 10);
+        // In order to ensure the atomicity of the recovery, the recovery process is as follows: 
+        // the recovered data is saved in a temporary object,
+        // the original object is deleted after the recovery is complete, 
+        // and the temporary object is renamed to the original object.
+        // if backfilling write is doing on original object and this will cause data loss.
+        // so we must write an temp rocover object.
+        if (cct->_conf->osd_backfilling_write && !cct->_conf->osd_backfilling_write_obj_prefix.empty()) {
+          if (strstr(soid.oid.name.c_str(), cct->_conf->osd_backfilling_write_obj_prefix.c_str()) != NULL) {
+            map<hobject_t, ObjectContextRef>::iterator i = recovering.find(soid);
+            // wait backfill object finish push process first to create temp obj 
+            // and recover omap header.
+            // case1: backfill shard recv last push op and delete temp obj, but primary
+            //        shard has not recv push reply and not erase recovering set;
+            //        so this case will cause write an unexist temp obj.
+            if (i != recovering.end() && !backfills_in_flight.count(soid)) {
+              if (last_backfill_started == soid) {
+                hobject_t target_oid;
+                // in order to mark backfilling write is doing
+                target_oid = get_temp_recovery_object(soid, eversion_t());
+                t->omap_setkeys(target_oid, to_set_bl);
+                dout(1) << "write backfill temp obj " << target_oid << dendl;
+                break;
+              }
+            }
+          }
+        }
       }
       obs.oi.set_flag(object_info_t::FLAG_OMAP);
       obs.oi.clear_omap_digest();
