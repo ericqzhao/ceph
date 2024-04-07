@@ -8654,6 +8654,25 @@ void PrimaryLogPG::finish_ctx(OpContext *ctx, int log_op_type)
       dout(10) << " no snapset (this is a clone)" << dendl;
     }
     ctx->op_t->setattrs(soid, attrs);
+    if (cct->_conf->osd_backfilling_write && !cct->_conf->osd_backfilling_write_obj_prefix.empty()) {
+      if (strstr(soid.oid.name.c_str(), cct->_conf->osd_backfilling_write_obj_prefix.c_str()) != NULL) {
+        map<hobject_t, ObjectContextRef>::iterator i = recovering.find(soid);
+        // wait backfill object finish push process first to create temp obj 
+        // and recover omap header.
+        // case1: backfill shard recv last push op and delete temp obj, but primary
+        //        shard has not recv push reply and not erase recovering set;
+        //        so this case will cause write an unexist temp obj.
+        if (i != recovering.end() && !backfills_in_flight.count(soid)) {
+          if (last_backfill_started == soid) {
+            hobject_t target_oid;
+            // in order to mark backfilling write is doing
+            target_oid = get_temp_recovery_object(soid, eversion_t());
+            ctx->op_t->setattrs(target_oid, attrs);
+            dout(1) << "write attr to backfill temp obj " << target_oid << dendl;
+          }
+        }
+      }
+    }
   } else {
     // reset cached oi
     ctx->new_obs.oi = object_info_t(ctx->obc->obs.oi.soid);
