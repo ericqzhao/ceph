@@ -1408,7 +1408,9 @@ public:
       std::move(entries),
       std::move(dups));
 
-    if (must_rebuild || debug_verify_stored_missing) {
+    if (must_rebuild || debug_verify_stored_missing ||
+      (store->cct->_conf->osd_backfilling_write &&
+      !store->cct->_conf->osd_backfilling_write_obj_prefix.empty())) {
       // build missing
       if (debug_verify_stored_missing || info.last_complete < info.last_update) {
 	ldpp_dout(dpp, 10)
@@ -1444,6 +1446,19 @@ public:
 	    if (oi.version < i->version) {
 	      ldpp_dout(dpp, 15) << "read_log_and_missing  missing " << *i
 				 << " (have " << oi.version << ")" << dendl;
+              // case: for recovering obj, new client op will update object oi version 
+              // but not update missing, so actually 
+              // recovering obj oi.version is bigger than missing record.
+              // when client op has completed on recovering object(not backfilling obj)
+              // but recovering is interrupted,
+              // we should update missing version.rm.
+              if (store->cct->_conf->osd_backfilling_write &&
+                !store->cct->_conf->osd_backfilling_write_obj_prefix.empty()) {
+                if (strstr(i->soid.oid.name.c_str(), cct->_conf->osd_backfilling_write_obj_prefix.c_str()) != NULL) {
+                  missing.add_next_event(*i);
+                  continue;
+                }
+              }
 	      if (debug_verify_stored_missing) {
 		auto miter = missing.get_items().find(i->soid);
 		ceph_assert(miter != missing.get_items().end());
@@ -1475,7 +1490,9 @@ public:
 	    }
 	  }
 	}
-	if (debug_verify_stored_missing) {
+        if (!debug_verify_stored_missing && !must_rebuild) {
+          ldpp_dout(dpp, 1) << "recovering write is happened" << dendl;
+        } else if (debug_verify_stored_missing) {
 	  for (auto &&i: missing.get_items()) {
 	    if (checked.count(i.first))
 	      continue;

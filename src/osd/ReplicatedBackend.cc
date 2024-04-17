@@ -654,7 +654,7 @@ void ReplicatedBackend::submit_transaction(
     for (auto it = temps.begin();it != temps.end();it++) {
       dout(1) << __func__ << " get temp obj " << *it << dendl;
     }
-    set<pg_shard_t> backfills;
+    set<pg_shard_t> backfills_and_async;
     if (parent->get_acting_recovery_backfill_shards().size() > 1) {
       if (op.op) {
         op.op->pg_trace.event("issue replication ops");
@@ -713,14 +713,63 @@ void ReplicatedBackend::submit_transaction(
   	    wr->trace.init("backfill replicated op", nullptr, &op.op->pg_trace);
           get_parent()->send_message_osd_cluster(
   	    shard.osd, wr, get_osdmap_epoch());
-          backfills.insert(shard);
+          backfills_and_async.insert(shard);
         }
       }
-  
+      // for async recover pg
+      if (parent->get_async_recovery_shards().size() >= 1) {
+        for (const auto& shard : parent->get_async_recovery_shards()) {
+          dout(1) << __func__ << " async recovery shard " << shard << dendl;
+          if (pushing.count(soid)) {
+                if (pushing[soid].count(shard)) {
+                  PushInfo *pi = &pushing[soid][shard];
+                  bool error = pushing[soid].begin()->second.recovery_progress.error;
+                  // data complete and an temp recover obj has be removed,
+                  // so we cannot write an temp recover obj.
+                  dout(1) << __func__ << " async recovery data complete " << pi->recovery_progress.data_complete << dendl;
+                  if (pi->recovery_progress.data_complete && !error) continue;     
+                }
+          }
+          if (shard == parent->whoami_shard()) continue;
+
+          ObjectStore::Transaction op_t2; // for backfill shard op
+          // only write an recover temp obj
+          // use pi->recovery_info.version to modify pg temp obj version.
+          // temp object name:
+          /* ss << "temp_recovering_" << info.pgid  // (note this includes the shardid)
+                << "_" << version
+                << "_" << info.history.same_interval_since
+                << "_" << target.snap;*/
+          // to filter temp obj transaction and modify verison
+          generate_transaction_for_backfilling_write(t, coll, log_entries, 
+            &op_t2, pushing[soid][shard].recovery_info.version);
+          const pg_info_t &pinfo = parent->get_shard_info().find(shard)->second;
+          Message *wr;
+          wr = generate_subop(
+  	    soid,
+  	    at_version,
+  	    tid,
+  	    reqid,
+  	    trim_to,
+  	    at_version,
+            added.size() ? *(added.begin()) : hobject_t(),
+            removed.size() ? *(removed.begin()) : hobject_t(),
+  	    logs,
+  	    hset_history,
+  	    op_t2,
+  	    shard,
+  	    pinfo);
+          if (op.op && op.op->pg_trace)
+  	    wr->trace.init("async recovery replicated op", nullptr, &op.op->pg_trace);
+          get_parent()->send_message_osd_cluster(
+  	    shard.osd, wr, get_osdmap_epoch());
+          backfills_and_async.insert(shard);
+        }      
+      }
       // for acting pg
       for (const auto& shard : get_parent()->get_acting_recovery_backfill_shards()) {
         if (shard == parent->whoami_shard()) continue;
-        if (backfills.count(shard)) continue;
+        if (backfills_and_async.count(shard)) continue;
         const pg_info_t &pinfo = parent->get_shard_info().find(shard)->second;
         Message *wr;
         wr = generate_subop(
@@ -1362,18 +1411,27 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
     // collections now.  Otherwise, we do it later on push.
     update_snaps = true;
   }
-
-  // flag set to true during async recovery
   bool async = false;
-  pg_missing_tracker_t pmissing = get_parent()->get_local_missing();
-  if (pmissing.is_missing(soid)) {
-    async = true;
-    dout(30) << __func__ << " is_missing " << pmissing.is_missing(soid) << dendl;
-    for (auto &&e: log) {
-      dout(30) << " add_next_event entry " << e << dendl;
-      get_parent()->add_local_next_event(e);
-      dout(30) << " entry is_delete " << e.is_delete() << dendl;
+  // recovering write should not update missing object 
+  // need version, otherwise this will result that
+  // recovery_info.version is inconsisent of missing object need.
+  if (cct->_conf->osd_backfilling_write && !cct->_conf->osd_backfilling_write_obj_prefix.empty() && !rm->opt.empty()) {
+    if (strstr(soid.oid.name.c_str(), cct->_conf->osd_backfilling_write_obj_prefix.c_str()) != NULL) {
+      dout(10) << __func__ << "ingore to update local missing when doing recovering write " << dendl;
     }
+  } else {
+    // flag set to true during async recovery
+    //bool async = false;
+    pg_missing_tracker_t pmissing = get_parent()->get_local_missing();
+    if (pmissing.is_missing(soid)) {
+      async = true;
+      dout(30) << __func__ << " is_missing " << pmissing.is_missing(soid) << dendl;
+      for (auto &&e: log) {
+        dout(30) << " add_next_event entry " << e << dendl;
+        get_parent()->add_local_next_event(e);
+        dout(30) << " entry is_delete " << e.is_delete() << dendl;
+      }
+    }      
   }
 
   parent->update_stats(m->pg_stats);

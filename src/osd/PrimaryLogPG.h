@@ -346,6 +346,10 @@ public:
     return backfill_targets;
   }
 
+  const set<pg_shard_t> &get_async_recovery_shards() const override {
+    return async_recovery_targets;
+  }
+
   std::ostream& gen_dbg_prefix(std::ostream& out) const override {
     return gen_prefix(out);
   }
