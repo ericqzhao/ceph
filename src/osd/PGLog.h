@@ -1454,7 +1454,7 @@ public:
               // we should update missing version.rm.
               if (store->cct->_conf->osd_backfilling_write &&
                 !store->cct->_conf->osd_backfilling_write_obj_prefix.empty()) {
-                if (strstr(i->soid.oid.name.c_str(), cct->_conf->osd_backfilling_write_obj_prefix.c_str()) != NULL) {
+                if (strstr(i->soid.oid.name.c_str(), store->cct->_conf->osd_backfilling_write_obj_prefix.c_str()) != NULL) {
                   missing.add_next_event(*i);
                   continue;
                 }
