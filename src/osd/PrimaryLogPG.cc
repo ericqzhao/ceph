@@ -604,7 +604,11 @@ bool PrimaryLogPG::should_send_op(
              << " beyond std::max(last_backfill_started "
              << ", peer_info[peer].last_backfill "
              << peer_info[peer].last_backfill << ")" << dendl;
-    if (cct->_conf->osd_backfilling_write && !cct->_conf->osd_backfilling_write_obj_prefix.empty()) {
+    // after recover backfill object start to run recover, we can send op trans.
+    if (cct->_conf->osd_backfilling_write &&
+        !cct->_conf->osd_backfilling_write_obj_prefix.empty() &&
+        recovering.count(hoid) &&
+        !backfills_in_flight.count(hoid)) {
       dout(10) << "backfilling obj can send op" << hoid << dendl;
       if(strstr(hoid.oid.name.c_str(), cct->_conf->osd_backfilling_write_obj_prefix.c_str()) != NULL) {
         return true;
@@ -617,8 +621,8 @@ bool PrimaryLogPG::should_send_op(
     if (cct->_conf->osd_backfilling_write &&
         !cct->_conf->osd_backfilling_write_obj_prefix.empty() &&
         recovering.count(hoid) &&
-        !backfills_in_flight.count(soid)) {
-      dout(10) << "recovering obj can send op" << hoid << dendl;
+        !backfills_in_flight.count(hoid)) {
+      dout(10) << "async recovering obj can send op" << hoid << dendl;
       if(strstr(hoid.oid.name.c_str(), cct->_conf->osd_backfilling_write_obj_prefix.c_str()) != NULL) {
         return true;
       }

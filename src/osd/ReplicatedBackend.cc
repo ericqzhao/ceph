@@ -766,10 +766,75 @@ void ReplicatedBackend::submit_transaction(
           backfills_and_async.insert(shard);
         }      
       }
-      // for acting pg
+      // for acting and recovering pg
       for (const auto& shard : get_parent()->get_acting_recovery_backfill_shards()) {
         if (shard == parent->whoami_shard()) continue;
         if (backfills_and_async.count(shard)) continue;
+        // for recovering pg(not include backfilling and async recovering)
+        if (pushing.count(soid)) {
+          if (pushing[soid].count(shard)) {
+            PushInfo *pi = &pushing[soid][shard];
+            bool error = pushing[soid].begin()->second.recovery_progress.error;
+            // data complete and an temp recover obj has be removed,
+            // so we cannot write an temp recover obj.
+            dout(1) << __func__ << " recovery data complete " << pi->recovery_progress.data_complete << dendl;
+            if (pi->recovery_progress.data_complete && !error) {
+              const pg_info_t &pinfo = parent->get_shard_info().find(shard)->second;
+              Message *wr;
+              wr = generate_subop(
+                soid,
+                at_version,
+                tid,
+                reqid,
+                trim_to,
+                at_version,
+                added.size() ? *(added.begin()) : hobject_t(),
+                removed.size() ? *(removed.begin()) : hobject_t(),
+                logs,
+                hset_history,
+                op_t,
+                shard,
+                pinfo);
+              if (op.op && op.op->pg_trace)
+                wr->trace.init("replicated op", nullptr, &op.op->pg_trace);
+              get_parent()->send_message_osd_cluster(
+                shard.osd, wr, get_osdmap_epoch());
+              continue;
+            }
+            ObjectStore::Transaction op_t2; // for backfill shard op
+            // only write an recover temp obj
+            // use pi->recovery_info.version to modify pg temp obj version.
+            // temp object name:
+            /* ss << "temp_recovering_" << info.pgid  // (note this includes the shardid)
+                  << "_" << version
+                  << "_" << info.history.same_interval_since
+                  << "_" << target.snap;*/
+            // to filter temp obj transaction and modify verison
+            generate_transaction_for_backfilling_write(t, coll, log_entries,
+              &op_t2, pushing[soid][shard].recovery_info.version);
+            const pg_info_t &pinfo = parent->get_shard_info().find(shard)->second;
+            Message *wr;
+            wr = generate_subop(
+              soid,
+              at_version,
+              tid,
+              reqid,
+              trim_to,
+              at_version,
+              added.size() ? *(added.begin()) : hobject_t(),
+              removed.size() ? *(removed.begin()) : hobject_t(),
+              logs,
+              hset_history,
+              op_t2,
+              shard,
+              pinfo);
+            if (op.op && op.op->pg_trace)
+              wr->trace.init("recovery replicated op", nullptr, &op.op->pg_trace);
+            get_parent()->send_message_osd_cluster(
+              shard.osd, wr, get_osdmap_epoch());
+            continue;
+          }
+        }
         const pg_info_t &pinfo = parent->get_shard_info().find(shard)->second;
         Message *wr;
         wr = generate_subop(
