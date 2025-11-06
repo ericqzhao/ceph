@@ -133,7 +133,12 @@ enum {
   l_bluestore_omap_get_values_lat,
   l_bluestore_clist_lat,
   l_bluestore_remove_lat,
-  l_bluestore_last
+  l_bluestore_last,
+  l_bluestore_state_prepare_do_write_phase1,
+  l_bluestore_state_prepare_do_write_phase2,
+  l_bluestore_state_prepare_do_write_phase3,
+  l_bluestore_state_prepare_do_write_phase4,
+  l_bluestore_state_prepare_do_write_phase5
 };
 
 #define META_POOL_ID ((uint64_t)-1ull)

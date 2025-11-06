@@ -4583,6 +4583,16 @@ void BlueStore::_init_logger()
 		 "kf_l", PerfCountersBuilder::PRIO_INTERESTING);
   b.add_time_avg(l_bluestore_state_prepare_lat, "state_prepare_lat",
     "Average prepare state latency");
+  b.add_time_avg(l_bluestore_state_prepare_do_write_phase1, "state_prepare_do_write_phase1_lat",
+    "Average prepare state latency");
+  b.add_time_avg(l_bluestore_state_prepare_do_write_phase2, "state_prepare_do_write_phase2_lat",
+    "Average prepare state latency");
+  b.add_time_avg(l_bluestore_state_prepare_do_write_phase3, "state_prepare_do_write_phase3_lat",
+    "Average prepare state latency");
+  b.add_time_avg(l_bluestore_state_prepare_do_write_phase4, "state_prepare_do_write_phase4_lat",
+    "Average prepare state latency");
+  b.add_time_avg(l_bluestore_state_prepare_do_write_phase5, "state_prepare_do_write_phase5_lat",
+    "Average prepare state latency");
   b.add_time_avg(l_bluestore_state_aio_wait_lat, "state_aio_wait_lat",
 		 "Average aio_wait state latency",
 		 "io_l", PerfCountersBuilder::PRIO_INTERESTING);
@@ -13539,16 +13549,18 @@ int BlueStore::_do_write(
   auto dirty_end = end;
 
   WriteContext wctx;
+  txc->log_state_latency(logger, l_bluestore_state_prepare_do_write_phase1);
   _choose_write_options(c, o, fadvise_flags, &wctx);
   o->extent_map.fault_range(db, offset, length);
   _do_write_data(txc, c, o, offset, length, bl, &wctx);
+  txc->log_state_latency(logger, l_bluestore_state_prepare_do_write_phase2);
   r = _do_alloc_write(txc, c, o, &wctx);
   if (r < 0) {
     derr << __func__ << " _do_alloc_write failed with " << cpp_strerror(r)
 	 << dendl;
     goto out;
   }
-
+  txc->log_state_latency(logger, l_bluestore_state_prepare_do_write_phase3);
   if (wctx.extents_to_gc.empty() ||
       wctx.extents_to_gc.range_start() > offset ||
       wctx.extents_to_gc.range_end() < offset + length) {
@@ -13567,7 +13579,7 @@ int BlueStore::_do_write(
              << std::dec << dendl;
     o->onode.size = end;
   }
-
+  txc->log_state_latency(logger, l_bluestore_state_prepare_do_write_phase4);
   if (benefit >= g_conf()->bluestore_gc_enable_total_threshold) {
     wctx.extents_to_gc.union_of(gc.get_extents_to_collect());
     dout(20) << __func__
@@ -13590,7 +13602,7 @@ int BlueStore::_do_write(
   }
   o->extent_map.compress_extent_map(dirty_start, dirty_end - dirty_start);
   o->extent_map.dirty_range(dirty_start, dirty_end - dirty_start);
-
+  txc->log_state_latency(logger, l_bluestore_state_prepare_do_write_phase5);
   r = 0;
 
  out:
