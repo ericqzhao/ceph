@@ -4423,6 +4423,7 @@ int PrimaryLogPG::trim_object(
       return -ENOLCK;
     }
     dout(0) << __func__ << ": coi.size " << coi.size << dendl;
+    PGTransaction *t = ctx->op_t.get();
     if (coi.size >= 64*1024)
         t->truncate(soid, cio.size - 64*1024);
     else
