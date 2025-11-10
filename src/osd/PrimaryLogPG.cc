@@ -4411,6 +4411,39 @@ int PrimaryLogPG::trim_object(
       << " repair needed " << (obc ? "(no obc->ssc or !exists)" : "(no obc)");
     return -ENOENT;
   }
+  object_info_t &coi = obc->obs.oi;
+
+  // truncate clone obj
+  if (coi.size > 0) {
+    const hobject_t& soid = coi.soid;
+    OpContextUPtr ctx = simple_opc_create(obc);
+    if (!ctx->lock_manager.get_snaptrimmer_write(coid, obc, first)) {
+      close_op_ctx(ctx.release());
+      dout(10) << __func__ << ": Unable to get a wlock on " << coid << dendl;
+      return -ENOLCK;
+    }
+    dout(0) << __func__ << ": coi.size " << coi.size << dendl;
+    if (coi.size >= 64*1024)
+        t->truncate(soid, cio.size - 64*1024);
+    else
+        t->truncate(soid, 0);
+    ctx->at_version = get_next_version();
+    coi.prior_version = coi.version;
+    coi.version = ctx->at_version;
+    ctx->log.push_back(
+      pg_log_entry_t(
+	pg_log_entry_t::MODIFY,
+	coid,
+	coi.version,
+	coi.prior_version,
+	0,
+	osd_reqid_t(),
+	ctx->mtime,
+	0)
+      );
+    *ctxp = std::move(ctx);
+    return 0;
+  }
 
   hobject_t head_oid = coid.get_head();
   ObjectContextRef head_obc = get_object_context(head_oid, false);
@@ -4422,7 +4455,7 @@ int PrimaryLogPG::trim_object(
 
   SnapSet& snapset = obc->ssc->snapset;
 
-  object_info_t &coi = obc->obs.oi;
+  //object_info_t &coi = obc->obs.oi;
   auto citer = snapset.clone_snaps.find(coid.snap);
   if (citer == snapset.clone_snaps.end()) {
     osd->clog->error() << "No clone_snaps in snapset " << snapset
