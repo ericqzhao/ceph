@@ -12402,7 +12402,7 @@ void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
       }
     } else if (r == 0) {
           derr << __func__ << " op " << op->op
-             << " cost time " << mono_clock::now() - start
+             << " cost time " << mono_clock::now() - tstart
              << dendl;
     }
   }
