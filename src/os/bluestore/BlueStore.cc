@@ -12048,7 +12048,7 @@ void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
        ++p, ++j) {
     cvec[j] = _get_collection(*p);
   }
-  
+  auto tstart = mono_clock::now();
   vector<OnodeRef> ovec(i.objects.size());
 
   for (int pos = 0; i.have_op(); ++pos) {
@@ -12400,6 +12400,10 @@ void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
         _dump_transaction<0>(cct, t);
 	ceph_abort_msg("unexpected error");
       }
+    } else if (r == 0) {
+          derr << __func__ << " op " << op->op
+             << " cost time " << mono_clock::now() - start
+             << dendl;
     }
   }
 }
