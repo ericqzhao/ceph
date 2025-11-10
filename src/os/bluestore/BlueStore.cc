@@ -12048,6 +12048,7 @@ void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
        ++p, ++j) {
     cvec[j] = _get_collection(*p);
   }
+  derr << __func__ << "txc " << txc  << " start" << dendl;
   auto tstart = mono_clock::now();
   vector<OnodeRef> ovec(i.objects.size());
 
