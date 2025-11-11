@@ -12402,7 +12402,7 @@ void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
 	ceph_abort_msg("unexpected error");
       }
     } else if (r == 0) {
-          derr << __func__ << "txc " << txc <<  " op " << op->op
+          dout(1) << __func__ << "txc " << txc <<  " op " << op->op
              << " cost time " << mono_clock::now() - tstart
              << dendl;
     }

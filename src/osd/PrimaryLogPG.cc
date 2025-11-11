@@ -4422,15 +4422,23 @@ int PrimaryLogPG::trim_object(
       dout(10) << __func__ << ": Unable to get a wlock on " << coid << dendl;
       return -ENOLCK;
     }
-    dout(0) << __func__ << ": coi.size " << coi.size << dendl;
+    dout(0) << __func__ << ": before truncate coi.size " << coi.size << dendl;
     PGTransaction *t = ctx->op_t.get();
-    if (coi.size >= 64*1024)
+    //TODO config truncate size
+    if (coi.size >= 64*1024) {
         t->truncate(soid, coi.size - 64*1024);
-    else
+        coi.size = coi.size - 64*1024;
+    } else {
         t->truncate(soid, 0);
+        coi.size = 0;
+    }
+    dout(0) << __func__ << ": after truncate coi.size " << coi.size << dendl;
     ctx->at_version = get_next_version();
     coi.prior_version = coi.version;
     coi.version = ctx->at_version;
+    bl.clear();
+    encode(coi, bl, get_osdmap()->get_features(CEPH_ENTITY_TYPE_OSD, nullptr));
+    t->setattr(coid, OI_ATTR, bl);
     ctx->log.push_back(
       pg_log_entry_t(
 	pg_log_entry_t::MODIFY,
