@@ -4255,6 +4255,11 @@ void PG::update_snap_map(
 	  derr << __func__ << " decode snaps failure on " << *i << dendl;
 	  snaps.clear();
 	}
+        if (snaps.size() == 1 && snaps[0].val == 0) {
+          derr << __func__ << " truncating snap obj " << i->soid << dendl;
+          return;
+        }
+
 	set<snapid_t> _snaps(snaps.begin(), snaps.end());
 
 	if (i->is_clone() || i->is_promote()) {
