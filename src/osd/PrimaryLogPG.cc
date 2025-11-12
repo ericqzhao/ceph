@@ -4437,6 +4437,7 @@ int PrimaryLogPG::trim_object(
     coi.prior_version = coi.version;
     coi.version = ctx->at_version;
     bl.clear();
+    vector<snapid_t> snaps = {snapid_t{}};
     encode(coi, bl, get_osdmap()->get_features(CEPH_ENTITY_TYPE_OSD, nullptr));
     t->setattr(coid, OI_ATTR, bl);
     ctx->log.push_back(
@@ -4450,6 +4451,11 @@ int PrimaryLogPG::trim_object(
 	ctx->mtime,
 	0)
       );
+    try {
+      using ceph::encode;
+      encode(snaps, ctx->log.back().snaps);
+    } catch (...) {
+    }
     *ctxp = std::move(ctx);
     return 0;
   }
