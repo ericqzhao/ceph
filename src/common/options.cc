@@ -3466,6 +3466,10 @@ std::vector<Option> get_global_options() {
     .set_default(2)
     .set_description(""),
 
+    Option("osd_pg_snap_truncate", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description(""),
+
     Option("osd_max_trimming_pgs", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(2)
     .set_description(""),

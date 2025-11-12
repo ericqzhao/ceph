@@ -695,6 +695,7 @@ OPTION(osd_heartbeat_min_size, OPT_INT) // the minimum size of OSD heartbeat mes
 
 // max number of parallel snap trims/pg
 OPTION(osd_pg_max_concurrent_snap_trims, OPT_U64)
+OPTION(osd_pg_snap_truncate, OPT_BOOL)
 // max number of trimming pgs
 OPTION(osd_max_trimming_pgs, OPT_U64)
 

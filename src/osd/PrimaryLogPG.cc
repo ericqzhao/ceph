@@ -4414,7 +4414,7 @@ int PrimaryLogPG::trim_object(
   object_info_t &coi = obc->obs.oi;
 
   // truncate clone obj
-  if (coi.size > 0) {
+  if (cct->_conf->osd_pg_snap_truncate && coi.size > 0) {
     const hobject_t& soid = coi.soid;
     OpContextUPtr ctx = simple_opc_create(obc);
     if (!ctx->lock_manager.get_snaptrimmer_write(coid, obc, first)) {
