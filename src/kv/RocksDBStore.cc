@@ -1054,6 +1054,18 @@ void RocksDBStore::RocksDBTransactionImpl::rm_range_keys(const string &prefix,
           if (!cnt) {
             bat.RollbackToSavePoint();
             bat.DeleteRange(cf, rocksdb::Slice(start), rocksdb::Slice(end));
+            for (int i = 0; i <= 7; ++i) {
+                int s = i * 16;
+                int e = (i == 7) ? -1 : (s + 15);
+            
+                string nstart = start + char(s);
+                string nend   = (i == 7) ? end : (start + char(e));
+            
+                db->compact_range_async(
+                    combine_strings(prefix, nstart),
+                    combine_strings(prefix, nend)
+                );
+            }
             return;
           }
           bat.Delete(cf, rocksdb::Slice(it->key()));
@@ -1063,6 +1075,18 @@ void RocksDBStore::RocksDBTransactionImpl::rm_range_keys(const string &prefix,
         bat.PopSavePoint();
       } else {
         bat.DeleteRange(cf, rocksdb::Slice(start), rocksdb::Slice(end));
+        for (int i = 0; i <= 7; ++i) {
+            int s = i * 16;
+            int e = (i == 7) ? -1 : (s + 15);
+        
+            string nstart = start + char(s);
+            string nend   = (i == 7) ? end : (start + char(e));
+        
+            db->compact_range_async(
+                combine_strings(prefix, nstart),
+                combine_strings(prefix, nend)
+            );
+        }
       }
     } else {
       auto it = db->get_iterator(prefix);
