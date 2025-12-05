@@ -5087,6 +5087,23 @@ std::vector<Option> get_global_options() {
     .set_long_description("How often (in seconds) to print KV sync thread utilization, "
       "not logged when set to 0 or when utilization is 0%"),
 
+    Option("bluestore_kv_sync_polling", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_flag(Option::FLAG_STARTUP)
+    .set_description("Use SPDK lock-free ring and polling mode for kv_sync_thread")
+    .set_long_description("When enabled and SPDK is available, kv_sync_thread will use "
+      "a lock-free ring buffer (spdk_ring) instead of mutex-protected deque, "
+      "and polling instead of condition variable wait. This can reduce lock "
+      "contention and improve performance under high concurrency."),
+
+    Option("bluestore_kv_sync_polling_interval_us", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(5)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("Polling interval in microseconds when kv_sync_thread has no work")
+    .set_long_description("When bluestore_kv_sync_polling is enabled and the queue is empty, "
+      "kv_sync_thread will sleep for this many microseconds before polling again. "
+      "Lower values reduce latency but increase CPU usage."),
+
 
     // -----------------------------------------
     // kstore

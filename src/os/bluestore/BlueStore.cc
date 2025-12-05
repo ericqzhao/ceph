@@ -43,6 +43,10 @@
 #include "common/blkdev.h"
 #include "common/numa.h"
 
+#ifdef HAVE_SPDK
+#include <spdk/env.h>
+#endif
+
 #define dout_context cct
 #define dout_subsys ceph_subsys_bluestore
 
@@ -10844,6 +10848,34 @@ void BlueStore::_txc_state_proc(TransContext *txc)
 	  _txc_applied_kv(txc);
 	}
       }
+#ifdef HAVE_SPDK
+      // Use SPDK lock-free ring in polling mode
+      if (kv_ring) {
+        // For unsubmitted transactions, we still need lock protection
+        // because kv_queue_unsubmitted requires ordered access
+        if (txc->state != TransContext::STATE_KV_SUBMITTED) {
+          std::lock_guard l(kv_lock);
+          kv_queue_unsubmitted.push_back(txc);
+          ++txc->osr->kv_committing_serially;
+        }
+
+        // Enqueue to lock-free ring
+        void *txc_ptr = static_cast<void*>(txc);
+        size_t enqueued = spdk_ring_enqueue(kv_ring, &txc_ptr, 1);
+        if (enqueued != 1) {
+          // Ring is full, fall back to lock-based queue
+          derr << __func__ << " SPDK ring full, falling back to lock-based queue" << dendl;
+          std::lock_guard l(kv_lock);
+          kv_queue.push_back(txc);
+          kv_cond.notify_one();
+        }
+
+        // Update atomic counters
+        if (txc->had_ios)
+          kv_ring_ios.fetch_add(1, std::memory_order_relaxed);
+        kv_ring_throttle_costs.fetch_add(txc->cost, std::memory_order_relaxed);
+      } else
+#endif
       {
 	std::lock_guard l(kv_lock);
 	kv_queue.push_back(txc);
@@ -11325,6 +11357,20 @@ void BlueStore::_kv_start()
 {
   dout(10) << __func__ << dendl;
 
+#ifdef HAVE_SPDK
+  // Initialize SPDK lock-free ring for kv_queue
+  if (cct->_conf->bluestore_kv_sync_polling) {
+    kv_ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, KV_RING_SIZE,
+                               SPDK_ENV_SOCKET_ID_ANY);
+    if (!kv_ring) {
+      derr << __func__ << " failed to create SPDK ring for kv_queue" << dendl;
+      ceph_abort_msg("failed to create SPDK ring");
+    }
+    kv_ring_stop.store(false);
+    dout(10) << __func__ << " created SPDK ring with size " << KV_RING_SIZE << dendl;
+  }
+#endif
+
   deferred_finisher.start();
   finisher.start();
   kv_sync_thread.create("bstore_kv_sync");
@@ -11334,6 +11380,14 @@ void BlueStore::_kv_start()
 void BlueStore::_kv_stop()
 {
   dout(10) << __func__ << dendl;
+
+#ifdef HAVE_SPDK
+  // Signal kv_sync_thread to stop via atomic flag for polling mode
+  if (kv_ring) {
+    kv_ring_stop.store(true);
+  }
+#endif
+
   {
     std::unique_lock l(kv_lock);
     while (!kv_sync_started) {
@@ -11353,6 +11407,16 @@ void BlueStore::_kv_stop()
   kv_sync_thread.join();
   kv_finalize_thread.join();
   ceph_assert(removed_collections.empty());
+
+#ifdef HAVE_SPDK
+  // Free SPDK ring after thread stopped
+  if (kv_ring) {
+    spdk_ring_free(kv_ring);
+    kv_ring = nullptr;
+    dout(10) << __func__ << " freed SPDK ring" << dendl;
+  }
+#endif
+
   {
     std::lock_guard l(kv_lock);
     kv_stop = false;
@@ -11369,9 +11433,302 @@ void BlueStore::_kv_stop()
   dout(10) << __func__ << " stopped" << dendl;
 }
 
+#ifdef HAVE_SPDK
+void BlueStore::_kv_sync_thread_polling()
+{
+  dout(10) << __func__ << " start" << dendl;
+  deque<DeferredBatch*> deferred_stable_queue; ///< deferred ios done + stable
+
+  // Signal that we've started (still need lock for this)
+  {
+    std::lock_guard l(kv_lock);
+    kv_sync_started = true;
+    kv_cond.notify_all();
+  }
+
+  auto t0 = mono_clock::now();
+  timespan twait = ceph::make_timespan(0);
+  size_t kv_submitted = 0;
+
+  // Batch buffer for dequeuing from ring
+  static constexpr size_t BATCH_SIZE = 64;
+  void *txc_batch[BATCH_SIZE];
+
+  while (!kv_ring_stop.load(std::memory_order_relaxed)) {
+    auto period = cct->_conf->bluestore_kv_sync_util_logging_s;
+    auto observation_period = ceph::make_timespan(period);
+    auto elapsed = mono_clock::now() - t0;
+    if (period && elapsed >= observation_period) {
+      dout(5) << __func__ << " utilization: idle "
+              << twait << " of " << elapsed
+              << ", submitted: " << kv_submitted << dendl;
+      t0 = mono_clock::now();
+      twait = ceph::make_timespan(0);
+      kv_submitted = 0;
+    }
+
+    ceph_assert(kv_committing.empty());
+
+    // Poll the lock-free ring
+    size_t dequeued = spdk_ring_dequeue(kv_ring, txc_batch, BATCH_SIZE);
+
+    // Also check lock-based queue for fallback entries
+    bool has_lock_based = false;
+    {
+      std::lock_guard l(kv_lock);
+      has_lock_based = !kv_queue.empty();
+      if (has_lock_based) {
+        kv_committing.swap(kv_queue);
+      }
+    }
+
+    // Add ring-dequeued items to kv_committing
+    for (size_t i = 0; i < dequeued; ++i) {
+      kv_committing.push_back(static_cast<TransContext*>(txc_batch[i]));
+    }
+
+    // Check deferred queues (still need lock for these)
+    deque<DeferredBatch*> deferred_done;
+    {
+      std::lock_guard l(kv_lock);
+      if (!deferred_done_queue.empty()) {
+        deferred_done.swap(deferred_done_queue);
+      }
+    }
+
+    bool has_work = !kv_committing.empty() ||
+                    !deferred_done.empty() ||
+                    (!deferred_stable_queue.empty() && deferred_aggressive);
+
+    if (!has_work) {
+      // Polling: short sleep to avoid CPU spinning
+      auto t = mono_clock::now();
+      usleep(cct->_conf->bluestore_kv_sync_polling_interval_us);
+      twait += mono_clock::now() - t;
+      continue;
+    }
+
+    // Process work
+    deque<TransContext*> kv_submitting;
+    deque<DeferredBatch*> deferred_stable;
+    uint64_t aios = 0, costs = 0;
+
+    // Get kv_queue_unsubmitted with lock
+    {
+      std::lock_guard l(kv_lock);
+      kv_submitting.swap(kv_queue_unsubmitted);
+    }
+    deferred_stable.swap(deferred_stable_queue);
+
+    // Get atomic counters
+    aios = kv_ring_ios.exchange(0, std::memory_order_relaxed);
+    costs = kv_ring_throttle_costs.exchange(0, std::memory_order_relaxed);
+
+    dout(20) << __func__ << " committing " << kv_committing.size()
+             << " submitting " << kv_submitting.size()
+             << " deferred done " << deferred_done.size()
+             << " stable " << deferred_stable.size()
+             << dendl;
+    dout(30) << __func__ << " committing " << kv_committing << dendl;
+    dout(30) << __func__ << " submitting " << kv_submitting << dendl;
+    dout(30) << __func__ << " deferred_done " << deferred_done << dendl;
+    dout(30) << __func__ << " deferred_stable " << deferred_stable << dendl;
+
+    auto start = mono_clock::now();
+
+    bool force_flush = false;
+    if (bluefs_single_shared_device && bluefs) {
+      if (aios) {
+        force_flush = true;
+      } else if (kv_committing.empty() && deferred_stable.empty()) {
+        force_flush = true;
+      } else if (deferred_aggressive) {
+        force_flush = true;
+      }
+    } else {
+      if (aios || !deferred_done.empty()) {
+        force_flush = true;
+      } else {
+        dout(20) << __func__ << " skipping flush (no aios, no deferred_done)" << dendl;
+      }
+    }
+
+    if (force_flush) {
+      dout(20) << __func__ << " num_aios=" << aios
+               << " force_flush=" << (int)force_flush
+               << ", flushing, deferred done->stable" << dendl;
+      bdev->flush();
+      deferred_stable.insert(deferred_stable.end(), deferred_done.begin(),
+                             deferred_done.end());
+      deferred_done.clear();
+    }
+    auto after_flush = mono_clock::now();
+
+    KeyValueDB::Transaction synct = db->get_transaction();
+
+    uint64_t new_nid_max = 0, new_blobid_max = 0;
+    if (nid_last + cct->_conf->bluestore_nid_prealloc/2 > nid_max) {
+      KeyValueDB::Transaction t =
+        kv_submitting.empty() ? synct : kv_submitting.front()->t;
+      new_nid_max = nid_last + cct->_conf->bluestore_nid_prealloc;
+      bufferlist bl;
+      encode(new_nid_max, bl);
+      t->set(PREFIX_SUPER, "nid_max", bl);
+      dout(10) << __func__ << " new_nid_max " << new_nid_max << dendl;
+    }
+    if (blobid_last + cct->_conf->bluestore_blobid_prealloc/2 > blobid_max) {
+      KeyValueDB::Transaction t =
+        kv_submitting.empty() ? synct : kv_submitting.front()->t;
+      new_blobid_max = blobid_last + cct->_conf->bluestore_blobid_prealloc;
+      bufferlist bl;
+      encode(new_blobid_max, bl);
+      t->set(PREFIX_SUPER, "blobid_max", bl);
+      dout(10) << __func__ << " new_blobid_max " << new_blobid_max << dendl;
+    }
+
+    for (auto txc : kv_committing) {
+      if (txc->state == TransContext::STATE_KV_QUEUED) {
+        txc->log_state_latency(logger, l_bluestore_state_kv_queued_lat);
+        int r = cct->_conf->bluestore_debug_omit_kv_commit ? 0 : db->submit_transaction(txc->t);
+        ceph_assert(r == 0);
+        ++kv_submitted;
+        txc->state = TransContext::STATE_KV_SUBMITTED;
+        _txc_applied_kv(txc);
+        --txc->osr->kv_committing_serially;
+        if (txc->osr->kv_submitted_waiters) {
+          std::lock_guard l(txc->osr->qlock);
+          txc->osr->qcond.notify_all();
+        }
+      } else {
+        ceph_assert(txc->state == TransContext::STATE_KV_SUBMITTED);
+        txc->log_state_latency(logger, l_bluestore_state_kv_queued_lat);
+      }
+      if (txc->had_ios) {
+        --txc->osr->txc_with_unstable_io;
+      }
+    }
+
+    throttle_bytes.put(costs);
+
+    if (bluefs &&
+        after_flush - bluefs_last_balance >
+        ceph::make_timespan(cct->_conf->bluestore_bluefs_balance_interval)) {
+      bluefs_last_balance = after_flush;
+      int r = _balance_bluefs_freespace();
+      ceph_assert(r >= 0);
+    }
+
+    for (auto b : deferred_stable) {
+      for (auto& txc : b->txcs) {
+        bluestore_deferred_transaction_t& wt = *txc.deferred_txn;
+        ceph_assert(wt.released.empty());
+        string key;
+        get_deferred_key(wt.seq, &key);
+        synct->rm_single_key(PREFIX_DEFERRED, key);
+      }
+    }
+
+    int r = cct->_conf->bluestore_debug_omit_kv_commit ? 0 : db->submit_transaction_sync(synct);
+    ceph_assert(r == 0);
+
+    {
+      std::unique_lock m(kv_finalize_lock);
+      if (kv_committing_to_finalize.empty()) {
+        kv_committing_to_finalize.swap(kv_committing);
+      } else {
+        kv_committing_to_finalize.insert(
+            kv_committing_to_finalize.end(),
+            kv_committing.begin(),
+            kv_committing.end());
+        kv_committing.clear();
+      }
+      if (deferred_stable_to_finalize.empty()) {
+        deferred_stable_to_finalize.swap(deferred_stable);
+      } else {
+        deferred_stable_to_finalize.insert(
+            deferred_stable_to_finalize.end(),
+            deferred_stable.begin(),
+            deferred_stable.end());
+        deferred_stable.clear();
+      }
+      kv_finalize_cond.notify_one();
+    }
+
+    if (new_nid_max) {
+      nid_max = new_nid_max;
+      dout(10) << __func__ << " nid_max now " << nid_max << dendl;
+    }
+    if (new_blobid_max) {
+      blobid_max = new_blobid_max;
+      dout(10) << __func__ << " blobid_max now " << blobid_max << dendl;
+    }
+
+    {
+      auto finish = mono_clock::now();
+      ceph::timespan dur_flush = after_flush - start;
+      ceph::timespan dur_kv = finish - after_flush;
+      ceph::timespan dur = finish - start;
+      dout(20) << __func__ << " committed " << kv_committing.size()
+        << " cleaned " << deferred_stable.size()
+        << " in " << dur
+        << " (" << dur_flush << " flush + " << dur_kv << " kv commit)"
+        << dendl;
+      log_latency("kv_flush",
+        l_bluestore_kv_flush_lat,
+        dur_flush,
+        cct->_conf->bluestore_log_op_age);
+      log_latency("kv_commit",
+        l_bluestore_kv_commit_lat,
+        dur_kv,
+        cct->_conf->bluestore_log_op_age);
+      log_latency("kv_sync",
+        l_bluestore_kv_sync_lat,
+        dur,
+        cct->_conf->bluestore_log_op_age);
+    }
+
+    if (bluefs) {
+      if (!bluefs_extents_reclaiming.empty()) {
+        dout(0) << __func__ << " releasing old bluefs 0x" << std::hex
+                 << bluefs_extents_reclaiming << std::dec << dendl;
+        int r = 0;
+        if (cct->_conf->bdev_enable_discard && cct->_conf->bdev_async_discard) {
+          r = bdev->queue_discard(bluefs_extents_reclaiming);
+          if (r == 0) {
+            goto clear;
+          }
+        } else if (cct->_conf->bdev_enable_discard) {
+          for (auto p = bluefs_extents_reclaiming.begin(); p != bluefs_extents_reclaiming.end(); ++p) {
+            bdev->discard(p.get_start(), p.get_len());
+          }
+        }
+        alloc->release(bluefs_extents_reclaiming);
+clear:
+        bluefs_extents_reclaiming.clear();
+      }
+    }
+
+    // previously deferred "done" are now "stable" by virtue of this commit cycle
+    deferred_stable_queue.swap(deferred_done);
+  } // end while loop
+
+  dout(10) << __func__ << " finish" << dendl;
+  kv_sync_started = false;
+}
+#endif
+
 void BlueStore::_kv_sync_thread()
 {
   dout(10) << __func__ << " start" << dendl;
+
+#ifdef HAVE_SPDK
+  // Use SPDK polling mode if kv_ring is available
+  if (kv_ring) {
+    _kv_sync_thread_polling();
+    return;
+  }
+#endif
+
   deque<DeferredBatch*> deferred_stable_queue; ///< deferred ios done + stable
   std::unique_lock l(kv_lock);
   ceph_assert(!kv_sync_started);

@@ -51,6 +51,10 @@ class Allocator;
 class FreelistManager;
 class BlueStoreRepairer;
 
+#ifdef HAVE_SPDK
+struct spdk_ring;
+#endif
+
 //#define DEBUG_CACHE
 //#define DEBUG_DEFERRED
 
@@ -1991,6 +1995,16 @@ private:
   bool kv_stop = false;
   bool kv_finalize_started = false;
   bool kv_finalize_stop = false;
+
+#ifdef HAVE_SPDK
+  // SPDK lock-free ring for kv_queue (MP/SC: multi-producer, single-consumer)
+  struct spdk_ring *kv_ring = nullptr;
+  static constexpr size_t KV_RING_SIZE = 65536;  // must be power of 2
+  std::atomic<uint64_t> kv_ring_ios{0};
+  std::atomic<uint64_t> kv_ring_throttle_costs{0};
+  std::atomic<bool> kv_ring_stop{false};
+#endif
+
   deque<TransContext*> kv_queue;             ///< ready, already submitted
   deque<TransContext*> kv_queue_unsubmitted; ///< ready, need submit by kv thread
   deque<TransContext*> kv_committing;        ///< currently syncing
@@ -2350,6 +2364,9 @@ private:
   void _kv_start();
   void _kv_stop();
   void _kv_sync_thread();
+#ifdef HAVE_SPDK
+  void _kv_sync_thread_polling();
+#endif
   void _kv_finalize_thread();
 
   bluestore_deferred_op_t *_get_deferred_op(TransContext *txc, OnodeRef o);
