@@ -10885,6 +10885,8 @@ void OSDShard::consume_map(
     if (slot->waiting.empty() &&
 	slot->num_running == 0 &&
 	slot->waiting_for_split.empty() &&
+	slot->to_process.empty() &&
+	!slot->processing &&
 	!slot->pg) {
       dout(20) << __func__ << "  " << pgid << " empty, pruning" << dendl;
       p = pg_slots.erase(p);
@@ -10931,6 +10933,8 @@ void OSDShard::_wake_pg_slot(
   }
   slot->waiting_peering.clear();
   ++slot->requeue_seq;
+  // Reset processing flag since items are being requeued
+  slot->processing = false;
 }
 
 void OSDShard::identify_splits_and_merges(
@@ -11198,6 +11202,13 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
     sdata->context_queue.swap(oncommits);
   }
 
+  OSDShardPGSlot *slot = nullptr;
+  spg_t token;
+
+  // Loop to find a slot that is not being processed by another thread.
+  // If a slot is already being processed, we add the item to its to_process
+  // queue and continue to dequeue the next item.
+ dequeue_next:
   if (sdata->pqueue->empty()) {
     if (osd->is_stopping()) {
       sdata->shard_lock.unlock();
@@ -11212,31 +11223,45 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
     return;
   }
 
-  OpQueueItem item = sdata->pqueue->dequeue();
-  if (osd->is_stopping()) {
-    sdata->shard_lock.unlock();
-    for (auto c : oncommits) {
-      dout(10) << __func__ << " discarding in-flight oncommit " << c << dendl;
-      delete c;
+  {
+    OpQueueItem item = sdata->pqueue->dequeue();
+    if (osd->is_stopping()) {
+      sdata->shard_lock.unlock();
+      for (auto c : oncommits) {
+	dout(10) << __func__ << " discarding in-flight oncommit " << c << dendl;
+	delete c;
+      }
+      return;    // OSD shutdown, discard.
     }
-    return;    // OSD shutdown, discard.
+
+    token = item.get_ordering_token();
+    auto r = sdata->pg_slots.emplace(token, nullptr);
+    if (r.second) {
+      r.first->second = make_unique<OSDShardPGSlot>();
+    }
+    slot = r.first->second.get();
+    dout(20) << __func__ << " " << token
+	     << (r.second ? " (new)" : "")
+	     << " to_process " << slot->to_process
+	     << " waiting " << slot->waiting
+	     << " waiting_peering " << slot->waiting_peering
+	     << dendl;
+    slot->to_process.push_back(std::move(item));
+    dout(20) << __func__ << " " << slot->to_process.back()
+	     << " queued" << dendl;
   }
 
-  const auto token = item.get_ordering_token();
-  auto r = sdata->pg_slots.emplace(token, nullptr);
-  if (r.second) {
-    r.first->second = make_unique<OSDShardPGSlot>();
+  // Check if another thread is already processing this slot.
+  // If so, skip and continue to dequeue the next item.
+  if (slot->processing) {
+    ++sdata->slot_processing_skipped;
+    dout(20) << __func__ << " " << token
+	     << " slot already being processed, skipping to next item"
+	     << " (total skipped: " << sdata->slot_processing_skipped << ")" << dendl;
+    goto dequeue_next;
   }
-  OSDShardPGSlot *slot = r.first->second.get();
-  dout(20) << __func__ << " " << token
-	   << (r.second ? " (new)" : "")
-	   << " to_process " << slot->to_process
-	   << " waiting " << slot->waiting
-	   << " waiting_peering " << slot->waiting_peering
-	   << dendl;
-  slot->to_process.push_back(std::move(item));
-  dout(20) << __func__ << " " << slot->to_process.back()
-	   << " queued" << dendl;
+  // Mark this slot as being processed by this thread
+  slot->processing = true;
 
  retry_pg:
   PGRef pg = slot->pg;
@@ -11269,6 +11294,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
       // raced with _wake_pg_slot or consume_map
       dout(20) << __func__ << " " << token
 	       << " nothing queued" << dendl;
+      slot->processing = false;
       pg->unlock();
       sdata->shard_lock.unlock();
       handle_oncommits(oncommits);
@@ -11279,6 +11305,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
 	       << " requeue_seq " << slot->requeue_seq << " > our "
 	       << requeue_seq << ", we raced with _wake_pg_slot"
 	       << dendl;
+      slot->processing = false;
       pg->unlock();
       sdata->shard_lock.unlock();
       handle_oncommits(oncommits);
@@ -11301,6 +11328,8 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
   ThreadPool::TPHandle tp_handle(osd->cct, hb, timeout_interval,
 				 suicide_interval);
 
+ process_next_item:
+  {
   // take next item
   auto qi = std::move(slot->to_process.front());
   slot->to_process.pop_front();
@@ -11341,6 +11370,8 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
 	      // we created the pg! drop out and continue "normally"!
 	      sdata->_attach_pg(slot, pg.get());
 	      sdata->_wake_pg_slot(token, slot);
+	      // _wake_pg_slot resets processing to false, restore it
+	      slot->processing = true;
 
 	      // identify split children between create epoch and shard epoch.
 	      osd->service.identify_splits_and_merges(
@@ -11379,12 +11410,14 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
       }
       unsigned pushes_to_free = qi.get_reserved_pushes();
       if (pushes_to_free > 0) {
+	slot->processing = false;
 	sdata->shard_lock.unlock();
 	osd->service.release_reserved_pushes(pushes_to_free);
 	handle_oncommits(oncommits);
 	return;
       }
     }
+    slot->processing = false;
     sdata->shard_lock.unlock();
     handle_oncommits(oncommits);
     return;
@@ -11393,6 +11426,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
     OSDMapRef osdmap = sdata->shard_osdmap;
     if (qi.get_map_epoch() > osdmap->get_epoch()) {
       _add_slot_waiter(token, slot, std::move(qi));
+      slot->processing = false;
       sdata->shard_lock.unlock();
       pg->unlock();
       handle_oncommits(oncommits);
@@ -11442,6 +11476,69 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
     tracepoint(osd, opwq_process_finish, reqid.name._type,
         reqid.name._num, reqid.tid, reqid.inc);
   }
+
+  } // end of process_next_item scope
+
+  // Check if there are more items to process in this slot (batch processing)
+  // Note: qi.run() typically unlocks pg internally (see OpQueueItem implementations).
+  // We need to reacquire shard_lock to check for more items.
+  sdata->shard_lock.lock();
+  {
+    auto q = sdata->pg_slots.find(token);
+    if (q != sdata->pg_slots.end()) {
+      slot = q->second.get();
+      if (!slot->to_process.empty()) {
+	// More items were added while we were processing.
+	// Continue processing them in batch.
+	++sdata->slot_batch_processed;
+	dout(20) << __func__ << " " << token
+		 << " batch processing, " << slot->to_process.size()
+		 << " more items (total batch: " << sdata->slot_batch_processed << ")" << dendl;
+	// Need to re-acquire pg lock for the next item
+	pg = slot->pg;
+	if (pg) {
+	  sdata->shard_lock.unlock();
+	  pg->lock();
+	  sdata->shard_lock.lock();
+	  // Re-validate slot after releasing and re-acquiring shard_lock
+	  q = sdata->pg_slots.find(token);
+	  if (q == sdata->pg_slots.end()) {
+	    // slot was removed
+	    pg->unlock();
+	    sdata->shard_lock.unlock();
+	    handle_oncommits(oncommits);
+	    return;
+	  }
+	  slot = q->second.get();
+	  if (slot->to_process.empty()) {
+	    // raced with _wake_pg_slot
+	    slot->processing = false;
+	    pg->unlock();
+	    sdata->shard_lock.unlock();
+	    handle_oncommits(oncommits);
+	    return;
+	  }
+	  if (slot->pg != pg) {
+	    // pg was detached
+	    pg->unlock();
+	    slot->processing = false;
+	    sdata->shard_lock.unlock();
+	    handle_oncommits(oncommits);
+	    return;
+	  }
+	  goto process_next_item;
+	} else {
+	  // pg is null, cannot batch process without pg
+	  slot->processing = false;
+	}
+      } else {
+	// No more items, clear the processing flag
+	slot->processing = false;
+      }
+    }
+    // else: slot was removed, nothing to do
+  }
+  sdata->shard_lock.unlock();
 
   handle_oncommits(oncommits);
 }

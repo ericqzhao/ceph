@@ -1119,6 +1119,10 @@ struct OSDShardPGSlot {
   deque<OpQueueItem> to_process; ///< order items for this slot
   int num_running = 0;          ///< _process threads doing pg lookup/lock
 
+  /// true if a thread is currently processing this slot's requests.
+  /// other threads should skip this slot and continue dequeuing.
+  bool processing = false;
+
   deque<OpQueueItem> waiting;   ///< waiting for pg (or map + pg)
 
   /// waiting for map (peering evt)
@@ -1144,6 +1148,10 @@ struct OSDShard {
   OSD *osd;
 
   string shard_name;
+
+  // Stats for slot processing optimization
+  std::atomic<uint64_t> slot_processing_skipped{0};  ///< times we skipped a slot being processed
+  std::atomic<uint64_t> slot_batch_processed{0};     ///< times we batch processed items
 
   string sdata_wait_lock_name;
   ceph::mutex sdata_wait_lock;
