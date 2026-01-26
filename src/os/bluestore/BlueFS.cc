@@ -2944,6 +2944,23 @@ int BlueFS::_allocate(uint8_t id, uint64_t len,
     extents.reserve(4);  // 4 should be (more than) enough for most allocations
     alloc_len = alloc[id]->allocate(round_up_to(len, alloc_size[id]),
 				    alloc_size[id], hint, &extents);
+    int count = 1;
+    vector<PExtentVector> extents_bak;
+    while(!extents.empty() && extents.size()>250 && count< 10)
+    {
+        int64_t hint_tmp = extents.back().end();
+        extents_bak.push_back(extents);
+        extents.clear();
+        dout(20) << __func__ << " alloc, hint_tmp " << hint_tmp << " extents: " << &extents << " extents_bak.size(): " << extents_bak.size() << dendl;
+        alloc_len = alloc[id]->allocate(round_up_to(len, alloc_size[id]),
+                                    alloc_size[id], hint_tmp, &extents);
+        dout(20) << __func__ << " alloc, extents.size: " << extents.size() << " count: " << count << dendl;
+        count++;
+     }
+     for (auto& p : extents_bak) {
+        alloc[id]->release(p);
+        p.clear();
+     }
   }
   if (!alloc[id] ||
       alloc_len < 0 ||

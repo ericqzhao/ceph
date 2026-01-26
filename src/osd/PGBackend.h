@@ -101,6 +101,9 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
        const ObjectRecoveryInfo &recovery_info
        ) = 0;
 
+     virtual bool is_backfilling_in_flight(const hobject_t &oid) = 0;
+     virtual void on_backfilling_write_recover(const hobject_t &oid) = 0;
+
      virtual void begin_peer_recover(
        pg_shard_t peer,
        const hobject_t oid) = 0;
@@ -162,7 +165,7 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
      virtual const set<pg_shard_t> &get_acting_recovery_backfill_shards() const = 0;
      virtual const set<pg_shard_t> &get_acting_shards() const = 0;
      virtual const set<pg_shard_t> &get_backfill_shards() const = 0;
-
+     virtual const set<pg_shard_t> &get_async_recovery_shards() const = 0;
      virtual std::ostream& gen_dbg_prefix(std::ostream& out) const = 0;
 
      virtual const map<hobject_t, set<pg_shard_t>> &get_missing_loc_shards()
